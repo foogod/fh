@@ -1,0 +1,1653 @@
+#!/usr/bin/env python
+
+from __future__ import with_statement
+
+'''
+fh ("For(each)Host") -- Run a command on multiple hosts (using ssh), in
+parallel, collect the results, and print them in an easily parseable form.
+
+Use 'fh --help' for command option information.
+
+Return Codes:
+  0 = All hosts completed successfully
+  1 = Some hosts completed with errors
+  2 = There were problems with the input host list (or the process was
+      interrupted) which may have prevented some intended hosts from being run.
+  3 = There were fatal errors with the command parameters.  No hosts were run.
+
+Note: This script can be insalled (i.e. symlinked) with the following alternate
+      names, for specific behaviors:
+  fhcmd - Equivalent to 'fh -c <...>'
+  fhsh  - Equivalent to 'fh --shell <...>'
+  fhscp - Equivalent to 'fh -pc scp <...>'
+'''
+
+import sys
+import os
+import re
+import time
+import signal
+import fcntl
+import termios
+import struct
+import errno
+import socket
+import select
+import math
+import types
+import inspect
+import optparse
+import Queue as queue
+import threading
+from threading import Thread
+from threading import currentThread as current_thread
+from subprocess import Popen, PIPE
+
+__version__ = '3.0.1'
+
+##############
+
+SSH_EXECUTABLE = 'ssh'
+DEFAULT_SSH_OPTS = dict(
+    BatchMode='yes',
+    ForwardX11='no',
+    StrictHostKeyChecking='no',
+    LogLevel='ERROR',
+)
+DEFAULT_NUM_CONNS = 20
+DEFAULT_SAVEFILE = "~/.fh.last"
+SHELL_EXECUTABLE = os.environ.get('SHELL', 'sh')
+CONSOLE_KEY = '\x06' # Ctrl-F
+
+def resolve_default_paths():
+  global SSH_EXECUTABLE
+  global SHELL_EXECUTABLE
+  global DEFAULT_SAVEFILE
+  if os.sep not in SSH_EXECUTABLE:
+    for p in os.environ['PATH'].split(os.pathsep):
+      f = os.path.join(p, SSH_EXECUTABLE)
+      if os.path.exists(f):
+        SSH_EXECUTABLE = f
+        break
+  if os.sep not in SHELL_EXECUTABLE:
+    for p in os.environ['PATH'].split(os.pathsep):
+      f = os.path.join(p, SHELL_EXECUTABLE)
+      if os.path.exists(f):
+        SHELL_EXECUTABLE = f
+        break
+  savefile = os.environ.get('FH_SAVEFILE')
+  if not savefile:
+    # Determine whether we have an associated terminal or not.  We can't just
+    # go by whether ctermid() returns something, because on some systems
+    # (including Linux), it just always returns /dev/tty, even if there is no
+    # controlling terminal for the process.  The only reliable way is to
+    # actually try to open it and see if we succeed...
+    try:
+      os.close(os.open(os.ctermid(), os.O_RDWR))
+      # We have a terminal.  Use the default (~/.fh.last) savefile
+      savefile = DEFAULT_SAVEFILE
+    except OSError:
+      # We do not have a terminal.  This probably means we're being run from
+      # cron or something, in which case we should not clobber the default
+      # savefile (which somebody may be using simultaneously in an interactive
+      # session)
+      savefile = '/dev/null'
+  DEFAULT_SAVEFILE = os.path.expanduser(savefile)
+
+resolve_default_paths()
+
+##############
+
+MODE_SSH = 0
+MODE_CMD = 1
+MODE_SH = 2
+
+EVENT_STARTED = 0
+EVENT_STDOUT = 1
+EVENT_STDERR = 2
+EVENT_COMPLETED = 3
+EVENT_KILLED = 4
+EVENT_FAILED = 4
+
+_rl_line_re = re.compile(r'(\r\n|\n\r|\r|\n)([^\r\n]+)[\r\n]')
+_rl_blankline_re = re.compile(r'\r\n[\r\n]|\n\r[\r\n]|\r\r|\n\n')
+
+def _read_lines(fd, line_callback):
+  line_buffer = '\r\n'
+  eof = False
+  while not eof:
+    try:
+      chunk = os.read(fd, 1024)
+    except OSError, e:
+      if e.errno == errno.EINTR:
+        continue
+      raise
+    if chunk:
+      line_buffer += chunk
+    else:
+      if line_buffer[-1] not in ('\r', '\n'):
+        line_buffer += '\n'
+      eof = True
+    i = 0
+    while True:
+      m = _rl_line_re.match(line_buffer, i)
+      if m:
+        line_callback(m.group(2))
+        i = m.end(2)
+        continue
+      m = _rl_blankline_re.match(line_buffer, i)
+      if m:
+        line_callback('')
+        i = m.end() - 1
+        continue
+      line_buffer = line_buffer[i:]
+      break
+
+def create_ssh_command(ssh_options, keyfile, host, remote_cmd):
+  cmd = [SSH_EXECUTABLE]
+  if keyfile:
+    cmd.extend(['-i', keyfile])
+  cmd.extend('-o%s=%s' % (k,v) for k,v in ssh_options.iteritems())
+  cmd.append(host)
+  cmd.extend(remote_cmd)
+  return cmd
+
+def hms(seconds):
+  seconds = int(seconds)
+  s = seconds % 60
+  m = (seconds // 60) % 60
+  h = seconds // 3600
+  return '%d:%02d:%02d' % (h, m, s)
+
+
+class State:
+  '''
+  This is a reimplementation of threading.Event with a couple of improvements.  First, in a boolean context, a State object is true if it is set or false if not, so you can do 'if state:' instead of 'if state.is_set():'.  Second, in addition to wait()ing for the state to become true, you can also wait() for it to become false again.  the wait_true() and wait_false() methods have also been added to make this more explicit/convenient.
+  '''
+
+  def __init__(self, state=False):
+    self._lock = threading.Condition()
+    self._state = bool(state)
+
+  def set(self, state=True):
+    state = bool(state)
+    with self._lock:
+      if self._state == state:
+        return False
+      self._state = state
+      self._lock.notifyAll()
+    return True
+
+  def clear(self):
+    return self.set(False)
+
+  def __nonzero__(self):
+    return self._state
+
+  def wait(self, timeout=None, state=True):
+    state = bool(state)
+    with self._lock:
+      if self._state == state:
+        return True
+      self._lock.wait(timeout)
+      if self._state == state:
+        return True
+    return False
+
+  def wait_true(self, timeout=None):
+    return self.wait(timeout, True)
+
+  def wait_false(self, timeout=None):
+    return self.wait(timeout, False)
+
+  def __repr__(self):
+    return '<State: %s>' % (self._state,)
+
+class HostRunnerEvent:
+  def __init__(self, host, type, data, tsindex, runner=None, hstatus=None):
+    self.host = host
+    self.type = type
+    self.data = data
+    self.tsindex = tsindex
+    self.runner = runner
+    self.hstatus = hstatus
+
+
+class HostStatus:
+  def __init__(self, runner, host):
+    self.runner = runner
+    self.host = host
+    self.rc = None
+    self.start_time = None
+    self.end_time = None
+    self.duration = None
+    self.killed = False
+    self.pid = None
+    self.store_output = runner.store_output
+    self.started = State(False)
+    self.completed = State(False)
+    self._lock = threading.Lock()
+    self._events = []
+    self._monitors = []
+
+  def process_event(self, event):
+    with self._lock:
+      if event.type == EVENT_STARTED:
+        self.start_time = event.data['tstamp']
+        self.pid = event.data.get('pid')
+        self._events.append(event)
+        self.started.set()
+      elif event.type in (EVENT_COMPLETED, EVENT_KILLED):
+        self.end_time = event.data['tstamp']
+        self.rc = event.data.get('rc')
+        self.duration = event.data.get('duration')
+        if self.duration is None and self.start_time is not None:
+          self.duration = self.end_time - self.start_time
+        event.data['duration'] = self.duration
+        self._events.append(event)
+        self.completed.set()
+      elif event.type in (EVENT_STDOUT, EVENT_STDERR):
+        if self.store_output:
+          self._events.append(event)
+      else:
+        self._events.append(event)
+      for m in self._monitors:
+        m.put(event)
+      if self.completed:
+        for m in self._monitors:
+          m.put(None)
+        self._monitors = []
+
+  def events(self, block=True):
+    if not block or self.completed:
+      for e in self._events:
+        yield e
+    else:
+      q = queue.Queue()
+      with self._lock:
+        for e in self._events:
+          q.put(e)
+        self._monitors.append(q)
+      while True:
+        e = q.get()
+        if e is None:
+          return
+        yield e
+
+  def last_event(self):
+    if self._events:
+      return self._events[-1]
+    return None
+
+  def clear_events(self):
+    self._events = []
+
+  def wait(self, timeout=None):
+    return self.completed.wait(timeout)
+
+  def has_output(self, event_types=(EVENT_STDOUT, EVENT_STDERR)):
+    if type(event_types) == int:
+      event_types = (event_types,)
+    for e in self._events:
+      if e.type in event_types:
+        return True
+    return False
+
+  def output(self, block=True):
+    for event in self.events(block):
+      if event.type in (EVENT_STDOUT, EVENT_STDERR):
+        yield event.data['line']
+
+  def stdout(self, block=True):
+    for event in self.events(block):
+      if event.type == EVENT_STDOUT:
+        yield event.data['line']
+
+  def stderr(self, block=True):
+    for event in self.events(block):
+      if event.type == EVENT_STDERR:
+        yield event.data['line']
+
+  def state(self):
+    if self.killed:
+      return 'killed'
+    if self.completed:
+      return 'completed'
+    if self.started:
+      return 'running'
+    return 'pending'
+
+class MultiHostRunner:
+  def __init__(self, hostlist, cmd_args, procs=20):
+    self.hostlist = hostlist
+    self.cmd_args = cmd_args
+    self.cmd = ' '.join(cmd_args).strip()
+    self.procs = procs
+    self.store_output = True
+    self.clear()
+
+  def cmd_for_host(self, host):
+    "This is a dummy routine which should be overridden on a concrete subclass"
+    return ['/bin/false']
+
+  def clear(self):
+    self.event_queue = queue.Queue()
+    self.pending_queue = None
+    self.run_start_time = None
+    self._host_statuses = {}
+    self.pending_hosts = []
+    self.running_hosts = []
+    self.completed_hosts = []
+    self.success_hosts = []
+    self.failure_hosts = []
+    self.killed_hosts = []
+    self.threads = []
+    self.paused = State()
+    self._lock = threading.RLock()
+    self._cancelling = False
+
+  def host_status(self, host):
+    with self._lock:
+      hstatus = self._host_statuses.get(host)
+      if not hstatus:
+        if not host in self.hostlist:
+          raise KeyError(host)
+        hstatus = HostStatus(self, host)
+        self._host_statuses[host] = hstatus
+      return hstatus
+
+  def host_state(self, host):
+    hstatus = self._host_statuses.get(host)
+    if not hstatus:
+      return 'pending'
+    return hstatus.state()
+
+  def __call__(self, host, thread_num='*'):
+    hstatus = self.host_status(host)
+    args = self.cmd_for_host(host)
+    def preexec():
+      # Before exec'ing the command, detach its process from the terminal so it
+      # doesn't receive any Ctrl-Cs, etc.
+      os.setpgrp()
+
+    with self._lock:
+      if hstatus.killed:
+        return
+      devnull = os.open('/dev/null', os.O_RDONLY)
+      try:
+        p = Popen(args, bufsize=-1, stdin=devnull, stdout=PIPE, stderr=PIPE, preexec_fn=preexec)
+      except OSError, e:
+        errmsg = "Unable to execute %s: %s" % (args, e.args[1])
+        self.new_event(host, EVENT_STARTED, tstamp=time.time(), pid=-1)
+        self.new_event(host, EVENT_STDERR, line=errmsg)
+        self.new_event(host, EVENT_COMPLETED, tstamp=time.time(), rc=-1)
+        return
+      self.new_event(host, EVENT_STARTED, tstamp=time.time(), pid=p.pid)
+    stdout_cb = lambda x: self.new_event(host, EVENT_STDOUT, line=x)
+    stderr_cb = lambda x: self.new_event(host, EVENT_STDERR, line=x)
+    thread_name = 'SSH-Stderr-%s (%s)' % (thread_num, host)
+    t = Thread(target=_read_lines, args=(p.stderr.fileno(), stderr_cb), name=thread_name)
+    t.daemon = True
+    t.start()
+    _read_lines(p.stdout.fileno(), stdout_cb)
+    t.join()
+    p.wait()
+    os.close(devnull)
+    with self._lock:
+      if hstatus.killed:
+        self.new_event(host, EVENT_KILLED, tstamp=time.time(), rc=None)
+      else:
+        self.new_event(host, EVENT_COMPLETED, tstamp=time.time(), rc=p.returncode)
+
+  def new_event(self, ehost, etype, **edata):
+    tsindex = time.time() - self.run_start_time
+    return self.process_event(HostRunnerEvent(ehost, etype, edata, tsindex))
+
+  def process_event(self, event):
+    with self._lock:
+      event.runner = self
+      if event.host:
+        if event.host not in self.hostlist:
+          self.hostlist.append(event.host)
+        hstatus = self.host_status(event.host)
+        event.hstatus = hstatus
+        if event.type == EVENT_STARTED:
+          hstatus.start_time = event.data['tstamp']
+          hstatus.pid = event.data.get('pid')
+          try:
+            self.pending_hosts.remove(event.host)
+          except ValueError:
+            pass
+          self.running_hosts.append(event.host)
+        elif event.type in (EVENT_COMPLETED, EVENT_KILLED):
+          hstatus.end_time = event.data['tstamp']
+          hstatus.rc = event.data.get('rc')
+          hstatus.duration = event.data.get('duration')
+          if hstatus.duration is None and hstatus.start_time is not None:
+            hstatus.duration = hstatus.end_time - hstatus.start_time
+          event.data['duration'] = hstatus.duration
+          try:
+            self.running_hosts.remove(event.host)
+          except ValueError:
+            pass
+          if hstatus.killed:
+            self.killed_hosts.append(event.host)
+          else:
+            self.completed_hosts.append(event.host)
+            if hstatus.rc == 0:
+              self.success_hosts.append(event.host)
+            else:
+              self.failure_hosts.append(event.host)
+        hstatus.process_event(event)
+    self.event_queue.put(event)
+    return event
+
+  def _threadfunc(self, inqueue):
+    this_thread = current_thread()
+    try:
+      thread_num = this_thread.getName().split('-')[-1]
+      while True:
+        self.paused.wait_false()
+        with self._lock:
+          try:
+            host = inqueue.get(False)
+            this_thread.current_host = host
+          except queue.Empty:
+            break
+        this_thread.setName('SSH-Worker-%s (%s)' % (thread_num, host))
+        self(host, thread_num)
+    finally:
+      with self._lock:
+        try:
+          self.threads.remove(this_thread)
+        except ValueError:
+          pass
+    if not self.threads:
+      self._cancelling = False
+      self.event_queue.put(None)
+
+  def start(self):
+    with self._lock:
+      if self.running():
+        return self.event_queue
+      self.pending_queue = queue.Queue()
+      self.pending_hosts = list(self.hostlist)
+      for host in self.hostlist:
+        self.pending_queue.put(host)
+      threads = []
+      for i in xrange(min(self.procs, len(self.hostlist))):
+        t = Thread(target=self._threadfunc, args=(self.pending_queue,))
+        t.daemon = True
+        threads.append(t)
+      self.threads = threads
+    self.unpause()
+    self.run_start_time = time.time()
+    for t in threads:
+      t.start()
+    return self.event_queue
+
+  def join(self):
+    while True:
+      try:
+        self.threads[0].join()
+      except IndexError:
+        return
+
+  def running(self):
+    return bool(self.threads)
+
+  def cancelling(self):
+    return self._cancelling
+
+  def run(self):
+    self.start()
+    self.join()
+    return self
+
+  def pause(self):
+    self.paused.set()
+
+  def unpause(self):
+    self.paused.clear()
+
+  def cancel(self):
+    self._cancelling = True
+    self.pause()
+    # Clear the pending queue
+    while True:
+      try:
+        host = self.pending_queue.get(False)
+      except queue.Empty:
+        break
+      self.kill(host)
+    self.unpause()
+    for t in self.threads:
+      host = getattr(t, 'current_host', None)
+      if host:
+        self.kill(t.current_host)
+
+  def kill(self, host, sig=signal.SIGTERM):
+    with self._lock:
+      hstatus = self.host_status(host)
+      if hstatus.end_time != None:
+        # Can't kill something that's already dead
+        return False
+      hstatus.killed = True
+      if hstatus.pid:
+        try:
+          os.kill(hstatus.pid, sig)
+        except OSError, e:
+          if e.errno == errno.ESRCH:
+            # This just means the process finished before we actually got
+            # around to killing it.  That's ok.
+            pass
+          # Other errnos either mean somebody passed us a bad signal number in
+          # sig, or something really screwy is going on here.
+          raise
+    return True
+
+
+class MultiHostRunnerSSH (MultiHostRunner):
+  def __init__(self, hostlist, cmd_args, procs=20, user=None, ssh_options=DEFAULT_SSH_OPTS, keyfile=None):
+    MultiHostRunner.__init__(self, hostlist, cmd_args, procs=procs)
+    self.user = user
+    self.ssh_options = ssh_options
+    self.keyfile = keyfile
+
+  def cmd_for_host(self, host):
+    if self.user:
+      if '@' in host:
+        host = host.split('@')[-1]
+      host = '%s@%s' % (self.user, host)
+    return create_ssh_command(self.ssh_options, self.keyfile, host, self.cmd_args)
+
+
+class MultiHostRunnerCmd (MultiHostRunner):
+  def __init__(self, hostlist, cmd_args, procs=20):
+    MultiHostRunner.__init__(self, hostlist, cmd_args, procs=procs)
+
+  def cmd_for_host(self, host):
+    cmd = []
+    for arg in self.cmd_args:
+      cmd.append(re.sub("%(%)?", lambda m: m.group(1) or host, arg))
+    return cmd
+
+
+class MultiHostRunnerShell (MultiHostRunner):
+  def __init__(self, hostlist, cmd_args, procs=20):
+    MultiHostRunner.__init__(self, hostlist, cmd_args, procs=procs)
+
+  def cmd_for_host(self, host):
+    cmd = []
+    for arg in self.cmd_args:
+      cmd.append(re.sub("%(%)?", lambda m: m.group(1) or host, arg))
+    return [SHELL_EXECUTABLE, '-c', ' '.join(cmd)]
+
+
+def progress_bar(mhr, width):
+  hostlist = mhr.hostlist
+  numhosts = len(hostlist)
+  ratio_width = math.log(numhosts, 10) * 2 + 1
+  sb_width = int(width - (3 + ratio_width))
+  ticks = min(sb_width, numhosts)
+  hosts_per_tick = float(numhosts) / ticks
+  statusbar = ''
+  done = 0
+  for t in xrange(ticks):
+    start = int(t * hosts_per_tick)
+    end = int((t + 1) * hosts_per_tick)
+    pending = 0
+    running = 0
+    ok = 0
+    err = 0
+    killed = 0
+    cancelled = 0
+    for host in hostlist[start:end]:
+      state = mhr.host_state(host)
+      if state == 'pending':
+        pending += 1
+      elif state == 'running':
+        running += 1
+      elif state == 'completed':
+        done += 1
+        if mhr.host_status(host).rc == 0:
+          ok += 1
+        else:
+          err += 1
+      elif state == 'killed':
+        if mhr.host_status(host).start_time is None:
+          cancelled += 1
+        else:
+          killed += 1
+    if running:
+      schar = '*'
+    elif pending:
+      schar = '.'
+    elif killed:
+      schar = 'X'
+    elif err:
+      schar = '!'
+    elif ok:
+      schar = '='
+    elif cancelled:
+      schar = ' '
+    else:
+      # We should never get here
+      schar = '?'
+    statusbar += schar
+  return '[%s] %d/%d' % (statusbar, done, numhosts)
+
+###################
+
+def tty_in_foreground(fd):
+  if fd is None:
+    return False
+  return os.tcgetpgrp(fd) == os.getpgrp()
+
+###################
+
+class ConsoleExit (Exception):
+  pass
+
+class Console:
+  prompt = 'FH> '
+
+  help_text = '''
+    Available commands:
+      help [<command>]  - Show help
+      continue          - Exit the console and continue
+      status            - Print general status about the run
+      progress [on|off] - Turn on/off the display of the progress bar
+      show <type>       - Show more specific information about the run
+      print <host>      - Print the output from a given host
+      pause             - Pause the pending queue
+      unpause           - Unpause the pending queue
+      kill <host>       - Kill or cancel a host's execution
+      abort             - Kill all running/pending hosts and exit fh
+    For more information on a particular command, use 'help <command>'
+  '''
+
+  def __init__(self, app, fd):
+    self.app = app
+    self.fd = fd
+    self.outfile = os.fdopen(os.dup(fd), 'w')
+    commands = []
+    for attr in dir(self):
+      if attr.startswith('cmd_'):
+        commands.append(attr[4:])
+    self.commands = commands
+    self.listening = State(False)
+    self.triggered = State(False)
+
+  def start_listening(self):
+    t = threading.Thread(target=self.listen)
+    t.start()
+    self.listening.wait()
+
+  def stop_listening(self):
+    self.listening.clear()
+
+  def listen(self):
+    self.listening.set()
+    orig_mode = termios.tcgetattr(self.fd)
+    cooked_mode = termios.tcgetattr(self.fd)
+    cbreak_mode = termios.tcgetattr(self.fd)
+    cbreak_mode[3] = cbreak_mode[3] & ~(termios.ECHO | termios.ICANON)
+    cbreak_mode[6][termios.VMIN] = 1
+    cbreak_mode[6][termios.VTIME] = 0
+    poll = select.poll()
+    poll.register(self.fd, select.POLLIN)
+    try:
+      termios.tcsetattr(self.fd, termios.TCSAFLUSH, cbreak_mode)
+      while True:
+        results = poll.poll(200)
+        if not self.listening:
+          break
+        if self.triggered:
+          self.triggered.clear()
+          termios.tcsetattr(self.fd, termios.TCSAFLUSH, cooked_mode)
+          self.run()
+          termios.tcsetattr(self.fd, termios.TCSAFLUSH, cbreak_mode)
+        if results:
+          key = os.read(self.fd, 1)
+          if key == CONSOLE_KEY:
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, cooked_mode)
+            self.run()
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, cbreak_mode)
+    finally:
+      termios.tcsetattr(self.fd, termios.TCSAFLUSH, orig_mode)
+
+  def start(self):
+    self.triggered.set()
+
+  def run(self):
+    self.app.suppress_tty_output()
+    try:
+      self.show_welcome()
+      self.show_prompt()
+      try:
+        _read_lines(self.fd, self.do_command)
+        self.output('')
+      except ConsoleExit:
+        pass
+    except Exception, e:
+      self.output(e) #FIXME: do traceback
+    finally:
+      self.app.resume_tty_output()
+
+  def do_command(self, cmd):
+    words = cmd.split()
+    if words:
+      cmd = words[0]
+      fname = self.match_choice(cmd, self.commands)
+      if isinstance(fname, str):
+        func = getattr(self, 'cmd_' + fname)
+        args = words[1:]
+        argspec = inspect.getargspec(func)
+        max_args = len(argspec[0]) - 1
+        min_args = max_args - len(argspec[3] or [])
+        if argspec[1]:
+          max_args = sys.maxint
+        if len(args) < min_args or len(args) > max_args:
+          self.output('Bad arguments for %s' % (repr(cmd),))
+          self.show_help(cmd)
+        else:
+          func(*args)
+      elif fname:
+        self.ambiguous_command(cmd, fname)
+      else:
+        self.bad_command(cmd)
+    self.show_prompt()
+
+  def match_choice(self, word, choices):
+    word = str(word).lower()
+    found = []
+    for choice in choices:
+      if choice == word:
+        return word
+      if choice.startswith(word):
+        found.append(choice)
+    if len(found) == 1:
+      return found[0]
+    return found
+
+  def output(self, text):
+    os.write(self.fd, str(text) + '\n')
+
+  def show_welcome(self):
+    self.output('')
+    self.output(self.app.status_text())
+    self.output('')
+    self.output("Starting interactive console.  Enter 'continue' to return, or 'help' for more options.")
+    self.output('')
+
+  def show_prompt(self):
+    os.write(self.fd, self.prompt)
+
+  def show_help(self, cmd=None):
+    if not cmd:
+      text = self.help_text
+    else:
+      func = getattr(self, 'cmd_' + cmd, None)
+      if not func:
+        self.bad_command(cmd)
+        return
+      if func.__doc__:
+        text = func.__doc__
+      else:
+        text = '(No help available for %s)' % (repr(cmd),)
+    m = re.search(r'[\r\n] *', text)
+    if m:
+      text = text.replace(m.group(0), '\n  ')
+    self.output('\n  %s\n' % (text.strip(),))
+
+  def bad_command(self, cmd):
+    self.output('Unrecognized command: %s' % (repr(cmd),))
+    self.output("(For a list of available commands, try 'help')")
+
+  def ambiguous_command(self, cmd, matches):
+    matches = [repr(x) for x in matches]
+    if len(matches) == 2:
+      match_txt = ' or '.join(matches)
+    else:
+      match_txt = ', '.join(matches[:-1]) + ', or ' + matches[-1]
+    self.output('Ambiguous command: %s could be %s' % (repr(cmd), match_txt))
+
+
+  def cmd_help(self, cmd=None, *cmdargs):
+    '''
+    Usage:
+      help           - Show general help information
+      help <command> - Show more specific help on a particular command.
+    '''
+
+    self.show_help(cmd)
+
+  def cmd_continue(self):
+    '''
+    Usage:
+      continue       - Exit the console and continue normal fh operation.
+    '''
+    raise ConsoleExit()
+
+  def cmd_status(self):
+    '''
+    Usage:
+      status         - Show status of running job
+    '''
+
+    self.output(self.app.status_text())
+
+  def cmd_progress(self, param=None):
+    '''
+    Usage:
+      progress on    - Turn progress display on
+      progress off   - Turn progress display off
+      progress       - Toggle progress display
+    '''
+
+    if param is None:
+      new_value = not self.app.options.progress
+    else:
+      onoff = self.match_choice(param, ['on', 'off', 'yes', 'no', 'true', 'false'])
+      if isinstance(onoff, str):
+        new_value = onoff in ('on', 'yes', 'true')
+      elif onoff:
+        return self.ambiguous_command(param, onoff)
+      else:
+        return self.bad_command('progress ' + param)
+    self.app.options.progress = new_value
+    if new_value:
+      enabled_str = 'On'
+    else:
+      enabled_str = 'Off'
+    self.output('Progress display: %s' % enabled_str)
+
+  def cmd_show(self, param):
+    '''
+    Usage:
+      show pending   - Show all hosts which have not yet started
+      show running   - Show all hosts which are currently executing
+      show completed - Show all hosts which have completed (or been killed)
+    '''
+
+    mhr = self.app.mhr
+    type = self.match_choice(param, ['pending', 'running', 'completed'])
+    if type == 'pending':
+      self.output('Pending Hosts:')
+      found = False
+      for host in mhr.hostlist:
+        if mhr.host_state(host) == 'pending':
+          self.output('  ' + host)
+          found = True
+      if not found:
+        self.output('  (no pending hosts)')
+    elif type == 'running':
+      self.output('Running Hosts:')
+      hosts = []
+      max_hostname = 0
+      tsindex_base = mhr.run_start_time
+      for host in mhr.hostlist:
+        if mhr.host_state(host) == 'running':
+          hstatus = mhr.host_status(host)
+          last_event = hstatus.last_event()
+          if last_event:
+            event_time = last_event.tsindex + tsindex_base
+          else:
+            event_time = hstatus.start_time
+          hosts.append((host, hstatus.start_time, event_time))
+          max_hostname = max(max_hostname, len(host))
+      if hosts:
+        self.output('  %-*s %8s %8s' % (max_hostname, 'Host', 'Duration', 'Last Output'))
+        self.output('  %-*s %8s %8s' % (max_hostname, '====', '========', '==========='))
+        now = time.time()
+        for host, stime, etime in hosts:
+          dur_str = hms(now - stime)
+          lev_str = hms(now - etime)
+          self.output('  %-*s %8s %8s' % (max_hostname, host, dur_str, lev_str))
+      else:
+        self.output('  (no running hosts)')
+    elif type == 'completed':
+      self.output('Completed Hosts:')
+      hosts = []
+      max_hostname = 0
+      for host in mhr.hostlist:
+        if mhr.host_state(host) in ('completed', 'killed'):
+          hstatus = mhr.host_status(host)
+          if hstatus.killed:
+            if hstatus.start_time:
+              rc = '(killed)'
+            else:
+              rc = '(cancelled)'
+          else:
+            rc = hstatus.rc
+          hosts.append((host, hstatus.duration, rc))
+          max_hostname = max(max_hostname, len(host))
+      if hosts:
+        self.output('  %-*s %8s %s' % (max_hostname, 'Host', 'Duration', 'Return Code'))
+        self.output('  %-*s %8s %s' % (max_hostname, '====', '========', '==========='))
+        now = time.time()
+        for host, duration, rc in hosts:
+          dur_str = hms(duration)
+          self.output('  %-*s %8s %s' % (max_hostname, host, dur_str, rc))
+      else:
+        self.output('  (no completed hosts)')
+    elif type:
+      return self.ambiguous_command(param, type)
+    else:
+      return self.bad_command('show ' + param)
+
+  def cmd_pause(self):
+    '''
+    Usage:
+      pause - Pause starting of new hosts
+
+    Note: When paused, currently running hosts will continue to execute, but no
+    new hosts will be started.
+    '''
+
+    self.app.mhr.pause()
+    self.output('Pending queue paused.')
+
+  def cmd_unpause(self):
+    '''
+    Usage:
+      unpause - Resume a previously paused run
+    '''
+
+    self.app.mhr.unpause()
+    self.output('Pending queue unpaused.')
+
+  def cmd_kill(self, host):
+    '''
+    Usage:
+      kill <host> - Kill a running or pending host
+    '''
+
+    mhr = self.app.mhr
+    try:
+      result = mhr.kill(host)
+    except KeyError:
+      return self.output('ERROR: No such host!')
+    if result:
+      if mhr.host_status(host).start_time is None:
+        self.output('Host %s cancelled (host was killed before it began running)' % (repr(host),))
+      else:
+        self.output('Host %s killed' % (repr(host),))
+    else:
+      if mhr.host_status(host).end_time is not None:
+        self.output('Host %s has already completed (not killed)' % (repr(host),))
+      else:
+        self.output('Unable to kill host %s' % (repr(host),))
+
+  def cmd_print(self, host):
+    '''
+    Usage:
+      print <host> - Print all events/output collected from <host> thus far
+
+    Note: Saved output is discarded once the host has completed and its results
+    have been output to stdout (unless the --collect-output (-W) option was
+    given on the command line), so this command will usually not show output
+    for hosts which are already finished.
+    '''
+
+    try:
+      hstatus = self.app.mhr.host_status(host)
+    except KeyError:
+      return self.output('ERROR: No such host!')
+
+    class output_options:
+      parse_friendly = False
+      timestamp = True
+      noprefix = False
+      flush_on_output = False
+
+    printed = False
+    for event in hstatus.events(False):
+      self.app.output_event(event, self.outfile, output_options)
+      printed = True
+    if not printed:
+      self.output('(No events for %s)' % (host,))
+
+  def cmd_abort(self):
+    '''
+    Usage:
+      abort - Kill all running/pending jobs and exit
+    '''
+
+    self.output('Killing all running/pending processes...')
+    self.app.mhr.cancel()
+    raise ConsoleExit()
+
+
+class OutputFile:
+  def __init__(self, file):
+    self.file = file
+    self.paused = State()
+
+  def write(self, data):
+    self.paused.wait_false()
+    try:
+      self.file.write(data)
+    except IOError, e:
+      if e.errno != errno.EPIPE:
+        raise
+
+  def flush(self):
+    try:
+      self.file.flush()
+    except IOError, e:
+      if e.errno != errno.EPIPE:
+        raise
+
+  def fileno(self):
+    return self.file.fileno()
+
+  def isatty(self):
+    return os.isatty(self.fileno())
+
+class Application:
+  typechar_map = {
+    EVENT_STARTED: '%',
+    EVENT_STDOUT: ':',
+    EVENT_STDERR: '!',
+    EVENT_COMPLETED: '=',
+    EVENT_KILLED: '*',
+  }
+  typestr_map = {
+    EVENT_STARTED: 'start',
+    EVENT_STDOUT: 'out',
+    EVENT_STDERR: 'err',
+    EVENT_COMPLETED: 'end',
+    EVENT_KILLED: 'killed',
+  }
+  typestr_rmap = dict((v,k) for k,v in typestr_map.items())
+  hostline_end_re = re.compile(r'[:!%=*] |[#;]')
+
+  def __init__(self):
+    self.result = None
+    self.sigint_received = False
+    self.last_progress = ''
+    self.clear_progress_on_stdout = False
+    self.progress_width = 79
+    self.stdin = sys.stdin
+    self.stdout = OutputFile(sys.stdout)
+    self.stderr = OutputFile(sys.stderr)
+    try:
+      self.tty_fd = os.open(os.ctermid(), os.O_RDWR)
+    except OSError:
+      self.tty_fd = None
+    if self.tty_fd is not None:
+      self.console = Console(self, self.tty_fd)
+    self.progress_fd = self.tty_fd
+    self.progress_enabled = False
+    self.printed_hosts = set()
+
+  def suppress_tty_output(self):
+    if self.stdout.isatty():
+      self.stdout.paused.set()
+    if self.stderr.isatty():
+      self.stderr.paused.set()
+    if self.progress_fd == self.tty_fd:
+      self.clear_progress()
+      self.progress_enabled = False
+
+  def resume_tty_output(self):
+    self.stdout.paused.clear()
+    self.stderr.paused.clear()
+    self.progress_enabled = self.options.progress
+    self.print_progress()
+
+  def status_text(self, prefix=''):
+    mhr = self.mhr
+    cmd = mhr.cmd
+    total = len(mhr.hostlist)
+    pending = 0
+    running = 0
+    done = 0
+    ok = 0
+    err = 0
+    cancelled = 0
+    killed = 0
+    for host in mhr.hostlist:
+      state = mhr.host_state(host)
+      if state == 'pending':
+        pending += 1
+      elif state == 'running':
+        running += 1
+      elif state == 'completed':
+        done += 1
+        if mhr.host_status(host).rc == 0:
+          ok += 1
+        else:
+          err += 1
+      elif state == 'killed':
+        if mhr.host_status(host).start_time is None:
+          cancelled += 1
+        else:
+          killed += 1
+    return '%sCommand: %s\n%sHosts: %d total (%d completed, %d running, %d pending)\n%sResults: %d successful, %d failed, %d killed, %d cancelled' % (prefix, cmd, prefix, total, done, running, pending, prefix, ok, err, killed, cancelled)
+
+  def process_comment_line(self, line, mhr):
+    if line.startswith('# Command:'):
+      mhr.cmd = line[10:].lstrip()
+    elif line.startswith('# Hostlist:'):
+      mhr.hostlist = line[11:].split()
+
+  def parse_event_line(self, line):
+    try:
+      host, typestr, tsindex, text = line.split(' ', 3)
+      etype = self.typestr_rmap[typestr]
+      edata = {}
+      etsindex = float(tsindex)
+      if etype == EVENT_STARTED:
+        edata['tstamp'] = int(text)
+      elif etype == EVENT_COMPLETED:
+        tstamp, duration, rc = text.split()
+        edata['tstamp'] = int(tstamp)
+        edata['duration'] = float(duration)
+        edata['rc'] = int(rc)
+      elif etype == EVENT_KILLED:
+        tstamp, duration = text.split()
+        edata['tstamp'] = int(tstamp)
+        edata['duration'] = float(duration)
+      else:
+        edata['line'] = text
+      return HostRunnerEvent(host, etype, edata, etsindex)
+    except (ValueError, KeyError):
+      return False
+
+  def parse_hostline(self, line):
+      m = self.hostline_end_re.search(line)
+      if m:
+        line = line[:m.start()]
+      line = line.replace(',', ' ').strip()
+      if not line:
+        return []
+      return line.split()
+
+  def read_hostlist(self):
+    if self.options.file:
+      if self.options.file == '-':
+        hostfile = self.stdin
+      else:
+        try:
+          hostfile = open(self.options.file, 'rb')
+        except Exception, e:
+          self.stderr.write('ERROR: Cannot open host file: %s\n' % (e,))
+          sys.exit(3)
+    elif self.options.hosts:
+      hostfile = None
+    else:
+      hostfile = self.stdin
+    hostlist = []
+    if self.options.hosts:
+      for line in self.options.hosts:
+        hostlist.extend(self.parse_hostline(line))
+    if hostfile:
+      for line in hostfile.xreadlines():
+        hostlist.extend(self.parse_hostline(line))
+      hostfile.close()
+
+    final_hostlist = []
+    for host in hostlist:
+      try:
+        socket.getaddrinfo(host, None)
+      except socket.gaierror, e:
+        self.stderr.write('ERROR: %s: %s (skipping)\n' % (host, e.args[1],))
+        self.result = max(self.result, 2)
+        continue
+      except Exception, e:
+        self.stderr.write('ERROR: Unexpected error resolving %s: %s (skipping)\n' % (host, e))
+        self.result = max(self.result, 2)
+        continue
+      if host not in final_hostlist:
+        final_hostlist.append(host)
+
+    return final_hostlist
+
+  def start_job(self, hostlist, cmd):
+    options = self.options
+    if hostlist:
+      if options.mode == MODE_SSH:
+        mhr = MultiHostRunnerSSH(hostlist, cmd, options.connections, options.user, options.sshopts)
+      elif options.mode == MODE_CMD:
+        mhr = MultiHostRunnerCmd(hostlist, cmd, options.connections)
+      elif options.mode == MODE_SH:
+        mhr = MultiHostRunnerShell(hostlist, cmd, options.connections)
+      else:
+        raise ValueError("Unknown value for options.mode setting")
+      mhr.start()
+      return mhr
+    else:
+      self.stderr.write('WARNING: No valid hosts provided.  Nothing to do!\n')
+      self.result = max(self.result, 2)
+
+  def start_replay(self):
+    options = self.options
+    def replay_thread(file, mhr):
+      try:
+        for line in file.xreadlines():
+          line = line.lstrip().rstrip('\r\n')
+          if line.startswith('#'):
+            self.process_comment_line(line, mhr)
+          else:
+            event = self.parse_event_line(line)
+            if event:
+              mhr.process_event(event)
+        file.close()
+      finally:
+        mhr.event_queue.put(None)
+
+    if options.savefile and options.savefile != '-':
+      try:
+        savefile = open(options.savefile, 'rb')
+      except Exception, e:
+        self.stderr.write('ERROR: Cannot open savefile: %s\n' % (e,))
+        sys.exit(3)
+    else:
+      return
+
+    mhr = MultiHostRunner([], '', 0)
+    t = Thread(target=replay_thread, args=(savefile, mhr), name='ReplayThread')
+    t.daemon = True
+    t.start()
+    return mhr
+
+  def process_results(self):
+    options = self.options
+    mhr = self.mhr
+
+    class savefile_options:
+      parse_friendly = True
+      flush_on_output = True
+
+    if not mhr:
+      return
+    if self.savefile:
+      self.savefile.write('# Command: %s\n' % (mhr.cmd,))
+      self.savefile.write('# Hostlist: %s\n' % (' '.join(mhr.hostlist),))
+    eq = mhr.event_queue
+    to_be_printed = list(mhr.hostlist)
+    while True:
+      event = eq.get()
+      if not event:
+        break
+      self.output_event(event, self.savefile, savefile_options)
+      if event.type in (EVENT_COMPLETED, EVENT_KILLED):
+        if event.data.get('rc') != 0:
+          self.result = max(self.result, 1)
+      if options.immediate:
+        self.maybe_print_event(event)
+      elif not options.collect_output:
+        if not to_be_printed:
+          # We've gotten events for a host which wasn't in the hostlist
+          # originally (this can happen if we're replaying events and didn't
+          # know the hostlist ahead of time).  We still want to print it, so
+          # pretend it was in the list.
+          to_be_printed = [event.host]
+        while to_be_printed:
+          # This will print each host's results, as soon as it's completed, as
+          # long as it's the next one in the list we're supposed to be printing.
+          # This keeps the results in order in the output even if they complete
+          # in a different order.
+          hstatus = mhr.host_status(to_be_printed[0])
+          if not hstatus.end_time:
+            break
+          for event in hstatus.events():
+            self.maybe_print_event(event)
+          # We're done with the stored output now.  No need to keep it around in
+          # memory...
+          hstatus.clear_events()
+          to_be_printed.pop(0)
+      if event.type in (EVENT_STARTED, EVENT_COMPLETED, EVENT_KILLED):
+        self.print_progress()
+
+    self.clear_progress('\n')
+    if options.collect_output:
+      for host in mhr.hostlist:
+        for event in mhr.host_status(host).events():
+          self.maybe_print_event(event)
+
+  def maybe_print_event(self, event):
+    options = self.options
+    if event.type in (EVENT_COMPLETED, EVENT_KILLED) and options.print_empty and not event.hstatus.has_output(EVENT_STDOUT):
+      # Pretend there was a blank line of output
+      self.maybe_print_event(HostRunnerEvent(hstatus.host, EVENT_STDOUT, {'line': ''}, 0))
+    if self.event_filter(event):
+      if options.list:
+        if event.host not in self.printed_hosts:
+          self.stdout.write(event.host + '\n')
+          self.printed_hosts.add(event.host)
+      else:
+        if self.clear_progress_on_stdout:
+          self.clear_progress()
+        self.output_event(event, self.stdout, options)
+    if options.immediate and self.clear_progress_on_stdout:
+      # We normally print progress after every start/completion event, but if
+      # we're doing immediate printing, we may be showing an output event and
+      # may not get a start/completion for a while.  Re-print the progress we
+      # just cleared so there's always a progress bar showing.
+      self.print_progress()
+
+  def event_filter(self, event):
+    options = self.options
+    if options.print_hosts and event.host not in options.print_hosts:
+      return False
+    if event.type not in options.output_events:
+      return False
+    hstatus = event.hstatus
+    if hstatus.rc is not None:
+      if options.failed and hstatus.rc == 0:
+        return False
+      if options.succeeded and hstatus.rc != 0:
+        return False
+    return True
+
+  def output_event(self, event, file, options):
+    if not file:
+      return
+    host = event.host
+    hstatus = event.hstatus
+    if options.parse_friendly:
+      typestr = self.typestr_map[event.type]
+      tsindex = event.tsindex
+      if tsindex is None:
+        tsindex = '-'
+      else:
+        tsindex = '%0.3f' % (tsindex,)
+      if event.type == EVENT_STARTED:
+        data = ['%d' % (hstatus.start_time,)]
+      elif event.type == EVENT_COMPLETED:
+        data = ['%d' % (hstatus.start_time,), '%0.3f' % (hstatus.duration,), str(hstatus.rc)]
+      elif event.type == EVENT_KILLED:
+        data = ['%d' % (hstatus.start_time,), '%0.3f' % (hstatus.duration,)]
+      else:
+        data = [event.data['line']]
+      file.write('%s %s %s %s\n' % (host, typestr, tsindex, ' '.join(data)))
+      if options.flush_on_output:
+        file.flush()
+    else:
+      typechar = self.typechar_map[event.type]
+      if event.type == EVENT_STARTED:
+        tstamp = hstatus.start_time
+        human_time = time.strftime('%Y-%m-%d.%H:%M:%S', time.localtime(tstamp))
+        text = 'Started:   %s' % (human_time)
+      elif event.type == EVENT_COMPLETED:
+        tstamp = hstatus.end_time
+        human_time = time.strftime('%Y-%m-%d.%H:%M:%S', time.localtime(tstamp))
+        text = 'Completed: %s (%0.3f seconds) RC=%d' % (human_time, hstatus.duration, hstatus.rc)
+      elif event.type == EVENT_KILLED:
+        tstamp = hstatus.end_time
+        human_time = time.strftime('%Y-%m-%d.%H:%M:%S', time.localtime(tstamp))
+        text = 'KILLED: %s (%0.3f seconds)' % (human_time, hstatus.duration)
+      if event.type == EVENT_STDOUT:
+        text = '%s' % (event.data['line'],)
+      elif event.type == EVENT_STDERR:
+        text = '%s' % (event.data['line'],)
+      tsindex = event.tsindex
+      if tsindex is None or not options.timestamp:
+        tsindex = ''
+      else:
+        tsindex = '%0.3f' % (tsindex,)
+      if options.noprefix:
+        file.write('%s\n' % (text,))
+      else:
+        file.write('%s%s%s %s\n' % (host, typechar, tsindex, text))
+      if options.flush_on_output:
+        file.flush()
+
+  def print_progress(self):
+    if not self.progress_enabled:
+      return
+    if self.progress_fd == self.tty_fd:
+      if not tty_in_foreground(self.progress_fd):
+        return
+    self.last_progress = progress_bar(self.mhr, self.progress_width)
+    os.write(self.progress_fd, self.last_progress + '\r')
+
+  def clear_progress(self, text=None):
+    if not self.last_progress:
+      return
+    if self.progress_fd == self.tty_fd:
+      if not tty_in_foreground(self.progress_fd):
+        self.last_progress = ''
+        return
+    if text is not None:
+      os.write(self.progress_fd, text)
+    else:
+      os.write(self.progress_fd, ' ' * len(self.last_progress) + '\r')
+    self.last_progress = ''
+
+  ##################
+
+  def sigint_handler(self, sig, frame):
+    self.sigint_received = True
+
+  def siginfo_handler(self, sig, frame):
+    if self.console and tty_in_foreground(self.console.fd):
+      self.console.start()
+    else:
+      if self.progress_fd is not None:
+        self.clear_progress()
+        os.write(self.progress_fd, self.status_text('--fh: ') + '\n')
+        self.print_progress()
+      else:
+        self.stderr.write(self.status_text('--fh: ') + '\n')
+
+  def main(self, argv):
+    self.result = 0
+
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    usage_text = 'Usage: %prog [options] command\n  (Note: list of hosts is read from stdin by default)'
+    epilog_text = 'Note: When using --command or --shell, any occurrence of "%" in the command will be replaced with the hostname (use "%%" for a literal percent character)'
+    version_text = 'For(each)Host version %s' % (__version__,)
+
+    parser = optparse.OptionParser(usage=usage_text, epilog=epilog_text, version=version_text, conflict_handler="resolve")
+    parser.disable_interspersed_args()
+
+    parser.add_option('--noconsole', action='store_true', help="Disable interactive console capability")
+
+    ogroup = optparse.OptionGroup(parser, 'Job Options')
+    ogroup.add_option('-h', '--hosts', metavar='HOSTLIST', action='append', help="Use the specified host list, instead of reading from stdin")
+    ogroup.add_option('-f', '--file', metavar='HOSTFILE', help="Read host list from a file, instead of stdin")
+    ogroup.add_option('-u', '--user', metavar='USERNAME', help="User to login to remote machines as")
+    ogroup.add_option('-n', '--connections', metavar='NUMBER', default=DEFAULT_NUM_CONNS, help="Number of processes/connections to run in parallel (default %d)" % (DEFAULT_NUM_CONNS,))
+    ogroup.add_option('-o', '--ssh-option', metavar='SSHOPT', action='append', default=[], help="Pass an option setting to the ssh command")
+    ogroup.add_option('-c', '--command', dest='mode_cmd', action='store_true', help="Run command locally instead of using ssh")
+    ogroup.add_option('--shell', dest='mode_shell', action='store_true', help="Run command locally in a subshell (Note: May require extra quoting)")
+    ogroup.add_option('-s', '--savefile', metavar='FILENAME', default=DEFAULT_SAVEFILE, help="File to save results in (for use with --last)")
+    ogroup.add_option('-l', '--last', action='store_true', help="Print results from last run again (do not run a new job)")
+    parser.add_option_group(ogroup)
+
+    ogroup = optparse.OptionGroup(parser, 'Output Options')
+    ogroup.add_option('-I', '--immediate', action='store_true', help="Print output as soon as it's available (output from different hosts may be intermingled)")
+    ogroup.add_option('-W', '--collect-output', action='store_true', help="Wait until all hosts have completed before printing any results")
+    ogroup.add_option('-O', '--print-stdout', dest='output_events', action='append_const', const=EVENT_STDOUT, help="Print stdout from each host")
+    ogroup.add_option('-E', '--print-stderr', dest='output_events', action='append_const', const=EVENT_STDERR, help="Print stderr from each host")
+    ogroup.add_option('-S', '--print-start', dest='output_events', action='append_const', const=EVENT_STARTED, help="Print start time for each host")
+    ogroup.add_option('-C', '--print-completion', dest='output_events', action='append_const', const=EVENT_COMPLETED, help="Print completion time and result code for each host")
+    ogroup.add_option('-K', '--print-killed', dest='output_events', action='append_const', const=EVENT_KILLED, help="Print killed hosts (implied by -C)")
+    ogroup.add_option('-A', '--print-all', action='store_true', help="Print all types of output (equivalent to -OESCK)")
+    ogroup.add_option('-T', '--timestamp', action='store_true', help="Print a timestamp for each line")
+    ogroup.add_option('-H', '--print-hosts', metavar='HOSTLIST', action='append', default=[], help="Only print the results from the specified host(s)")
+    ogroup.add_option('-P', '--parse-friendly', action='store_true', help="Produce output in a format easier to parse by shell utilities")
+    ogroup.add_option('-N', '--noprefix', action='store_true', help="Do not prefix output lines with hostname/etc")
+    ogroup.add_option('-L', '--list', action='store_true', help="Only print hostnames, not other info")
+    ogroup.add_option('--print-empty', action='store_true', help="Print a blank line for hosts which had no output")
+    ogroup.add_option('--failed', action='store_true', help="Only print output from hosts with a nonzero return status")
+    ogroup.add_option('--succeeded', action='store_true', help="Only print output from hosts with a zero return status")
+    ogroup.add_option('-p', '--progress', action='store_true', help="Show progress information while running")
+    ogroup.add_option('--noprogress', action='store_true', help="Do not show progress information")
+    ogroup.add_option('--progress-stderr', action='store_true', help="Show progress information on stderr instead of tty")
+    parser.add_option_group(ogroup)
+
+    script_name = os.path.basename(argv[0])
+    args = sys.argv[1:]
+    if script_name == "fhscp":
+      args = ['-pc', 'scp'] + args
+    (options, cmd) = parser.parse_args(args)
+
+    # Validate job option parameters
+
+    if options.mode_shell:
+      options.mode = MODE_SH
+    elif options.mode_cmd:
+      options.mode = MODE_CMD
+    else:
+      if script_name == "fhsh":
+        options.mode = MODE_SH
+      elif script_name == "fhcmd":
+        options.mode = MODE_CMD
+      else:
+        options.mode = MODE_SSH
+
+    if options.last:
+      if cmd:
+        self.stderr.write('ERROR: You cannot specify both --last and a command at the same time\n')
+        parser.print_help()
+    elif not cmd:
+      self.stderr.write('ERROR: You must specify either a command or --last\n')
+      parser.print_help()
+      sys.exit(3)
+
+    options.sshopts = dict(DEFAULT_SSH_OPTS)
+    for opt in options.ssh_option:
+      try:
+        k,v = opt.split('=', 1)
+      except ValueError:
+        self.stderr.write('ERROR: SSH options must be of the form "name=value": %s\n' % (repr(opt),))
+      options.sshopts[k] = v
+
+    try:
+      options.connections = int(options.connections)
+    except ValueError:
+      options.connections = 0
+    if options.connections <= 0:
+      self.stderr.write('ERROR: Number of connections must be a positive integer.\n')
+      parser.print_help()
+      sys.exit(3)
+
+    if options.noconsole:
+      self.console = None
+
+    # Validate output option parameters
+
+    if options.print_all:
+      options.output_events = [EVENT_STARTED, EVENT_STDOUT, EVENT_STDERR, EVENT_COMPLETED, EVENT_KILLED]
+    elif not options.output_events:
+      if options.list:
+        # If they specified -L without specifying an output type, assume -C
+        options.output_events = [EVENT_COMPLETED]
+      else:
+        options.output_events = [EVENT_STDOUT, EVENT_STDERR]
+    if EVENT_COMPLETED in options.output_events:
+      options.output_events.append(EVENT_KILLED)
+    options.output_events = frozenset(options.output_events)
+
+    print_hosts = set()
+    for line in options.print_hosts:
+      print_hosts.update(self.parse_hostline(line))
+    for host in list(print_hosts):
+      # Try to find any other known names/IPs for the specified hostname and
+      # include them in the list too.
+      try:
+        for ai in socket.getaddrinfo(host, None, 0, 0, 0, socket.AI_CANONNAME):
+          if ai[3]:
+            print_hosts.add(ai[3])
+          print_hosts.add(ai[4][0])
+      except socket.gaierror, e:
+        self.stderr.write('WARNING: Could not resolve host %s: %s\n' % (host, e.args[1],))
+    options.print_hosts = frozenset(print_hosts)
+
+    options.flush_on_output = options.immediate
+
+    # Misc useful values for other routines
+
+    if options.noprogress:
+      options.progress = False
+    elif options.progress_stderr:
+      options.progress = True
+      self.progress_fd = self.stderr.fileno()
+    elif self.progress_fd is None:
+      options.progress = False
+    elif options.progress is None:
+      if not options.last and self.stdout.isatty():
+        options.progress = True
+    self.progress_enabled = options.progress
+
+    try:
+      winsz = fcntl.ioctl(self.progress_fd, termios.TIOCGWINSZ, '____')
+      self.progress_width = struct.unpack('hh', winsz)[1] - 1
+    except:
+      pass
+
+    if self.progress_enabled and os.path.sameopenfile(self.stdout.fileno(), self.progress_fd):
+      self.clear_progress_on_stdout = True
+    elif os.isatty(self.stdout.fileno()) and os.isatty(self.progress_fd):
+      # We play it safe in this case, because stdout and progress_fd may be
+      # pointing to the same ultimate tty, but using different device files
+      # (i.e. /dev/tty vs. /dev/pts/#)
+      self.clear_progress_on_stdout = True
+
+    self.options = options
+
+    # Assemble the hostlist
+
+    if not options.last:
+      hostlist = self.read_hostlist()
+
+    # Kick off the job
+
+    signal.signal(signal.SIGINT, self.sigint_handler)
+    signal.signal(signal.SIGUSR1, self.siginfo_handler)
+    signal.signal(signal.SIGURG, self.siginfo_handler)
+    if hasattr(signal, 'SIGINFO'):
+      signal.signal(signal.SIGINFO, self.siginfo_handler)
+
+    if self.console:
+      self.console.start_listening()
+
+    self.savefile = None
+    if options.last:
+      mhr = self.start_replay()
+    else:
+      if options.savefile and options.savefile != '-':
+        try:
+          self.savefile = open(options.savefile, 'wb')
+        except Exception, e:
+          self.stderr.write('WARNING: Cannot open savefile: %s\n' % (e,))
+      mhr = self.start_job(hostlist, cmd)
+
+    self.mhr = mhr
+
+    # Print the results
+
+    t = Thread(target=self.process_results, name='Main')
+    t.daemon = True
+    t.start()
+    while t.isAlive():
+      t.join(0.5)
+      if self.sigint_received:
+        self.clear_progress()
+        if mhr.cancelling():
+          self.stderr.write('Second interrupt signal received. Abandoning running processes!\n')
+          break
+        self.stderr.write('Interrupt signal received. Killing running processes...\n')
+        self.result = max(self.result, 2)
+        mhr.cancel()
+        self.sigint_received = False
+
+    if self.console:
+      self.console.stop_listening()
+
+    return self.result
+
+if __name__ == '__main__':
+  try:
+    sys.exit(Application().main(sys.argv))
+  except KeyboardInterrupt:
+    sys.exit(2)
+
+
