@@ -41,9 +41,10 @@ import Queue as queue
 import threading
 from threading import Thread
 from threading import currentThread as current_thread
-from subprocess import Popen, PIPE
+import subprocess
+from subprocess import PIPE
 
-__version__ = '3.0.1'
+__version__ = '3.1.0'
 
 ##############
 
@@ -375,7 +376,7 @@ class MultiHostRunner:
         return
       devnull = os.open('/dev/null', os.O_RDONLY)
       try:
-        p = Popen(args, bufsize=-1, stdin=devnull, stdout=PIPE, stderr=PIPE, preexec_fn=preexec)
+        p = subprocess.Popen(args, bufsize=-1, stdin=devnull, stdout=PIPE, stderr=PIPE, preexec_fn=preexec)
       except OSError, e:
         errmsg = "Unable to execute %s: %s" % (args, e.args[1])
         self.new_event(host, EVENT_STARTED, tstamp=time.time(), pid=-1)
@@ -1166,6 +1167,38 @@ class Application:
         return []
       return line.split()
 
+  def check_host(self, host):
+    # First, check to see whether our ssh config (i.e. ~/.ssh/config or
+    # /etc/ssh/ssh_config) has configuration defined for this hostname which
+    # might cause it to map to something other than what it appears to be
+    cmd = [SSH_EXECUTABLE, '-TG', host]
+    output = subprocess.check_output(cmd)
+    ssh_config = {}
+    for line in output.strip().split('\n'):
+      try:
+        k, v = line.split(' ', 1)
+        ssh_config[k] = v
+      except ValueError:
+        pass
+    host = ssh_config.get('hostname', host)
+
+    if 'proxycommand' in ssh_config:
+      # If there's a ProxyCommand defined for this host in the ssh config, then
+      # this may not even be a real hostname, but is still potentially valid,
+      # so don't check it any further.
+      return True
+
+    # Make sure that the host is resolvable
+    try:
+      socket.getaddrinfo(host, None)
+    except socket.gaierror, e:
+      self.stderr.write('ERROR: %s: %s (skipping)\n' % (host, e.args[1],))
+      return False
+    except Exception, e:
+      self.stderr.write('ERROR: Unexpected error resolving %s: %s (skipping)\n' % (host, e))
+      return False
+    return True
+
   def read_hostlist(self):
     if self.options.file:
       if self.options.file == '-':
@@ -1189,16 +1222,12 @@ class Application:
         hostlist.extend(self.parse_hostline(line))
       hostfile.close()
 
+    if self.options.nohostcheck:
+      return hostlist
+
     final_hostlist = []
     for host in hostlist:
-      try:
-        socket.getaddrinfo(host, None)
-      except socket.gaierror, e:
-        self.stderr.write('ERROR: %s: %s (skipping)\n' % (host, e.args[1],))
-        self.result = max(self.result, 2)
-        continue
-      except Exception, e:
-        self.stderr.write('ERROR: Unexpected error resolving %s: %s (skipping)\n' % (host, e))
+      if not self.check_host(host):
         self.result = max(self.result, 2)
         continue
       if host not in final_hostlist:
@@ -1457,6 +1486,7 @@ class Application:
     ogroup.add_option('-o', '--ssh-option', metavar='SSHOPT', action='append', default=[], help="Pass an option setting to the ssh command")
     ogroup.add_option('-c', '--command', dest='mode_cmd', action='store_true', help="Run command locally instead of using ssh")
     ogroup.add_option('--shell', dest='mode_shell', action='store_true', help="Run command locally in a subshell (Note: May require extra quoting)")
+    ogroup.add_option('--nohostcheck', action='store_true', help="Don't check hostnames before starting")
     ogroup.add_option('-s', '--savefile', metavar='FILENAME', default=DEFAULT_SAVEFILE, help="File to save results in (for use with --last)")
     ogroup.add_option('-l', '--last', action='store_true', help="Print results from last run again (do not run a new job)")
     parser.add_option_group(ogroup)

@@ -44,6 +44,7 @@ Options:
     -c, --command       Run command locally instead of using ssh
     --shell             Run command locally in a subshell (Note: May require
                         extra quoting)
+    --nohostcheck       Don't check hostnames before starting
     -s FILENAME, --savefile=FILENAME
                         File to save results in (for use with --last)
     -l, --last          Print results from last run again (do not run a new
