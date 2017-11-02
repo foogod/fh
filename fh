@@ -44,7 +44,7 @@ from threading import currentThread as current_thread
 import subprocess
 from subprocess import PIPE
 
-__version__ = '3.1.0'
+__version__ = '3.1.1'
 
 ##############
 
@@ -1636,12 +1636,11 @@ class Application:
     if hasattr(signal, 'SIGINFO'):
       signal.signal(signal.SIGINFO, self.siginfo_handler)
 
-    if self.console:
-      self.console.start_listening()
-
     self.savefile = None
     if options.last:
       mhr = self.start_replay()
+      # There's no point in a console for '--last' runs
+      self.console = None
     else:
       if options.savefile and options.savefile != '-':
         try:
@@ -1652,25 +1651,29 @@ class Application:
 
     self.mhr = mhr
 
-    # Print the results
-
-    t = Thread(target=self.process_results, name='Main')
-    t.daemon = True
-    t.start()
-    while t.isAlive():
-      t.join(0.5)
-      if self.sigint_received:
-        self.clear_progress()
-        if mhr.cancelling():
-          self.stderr.write('Second interrupt signal received. Abandoning running processes!\n')
-          break
-        self.stderr.write('Interrupt signal received. Killing running processes...\n')
-        self.result = max(self.result, 2)
-        mhr.cancel()
-        self.sigint_received = False
-
     if self.console:
-      self.console.stop_listening()
+      self.console.start_listening()
+
+    try:
+      # Print the results
+
+      t = Thread(target=self.process_results, name='Main')
+      t.daemon = True
+      t.start()
+      while t.isAlive():
+        t.join(0.5)
+        if self.sigint_received:
+          self.clear_progress()
+          if mhr.cancelling():
+            self.stderr.write('Second interrupt signal received. Abandoning running processes!\n')
+            break
+          self.stderr.write('Interrupt signal received. Killing running processes...\n')
+          self.result = max(self.result, 2)
+          mhr.cancel()
+          self.sigint_received = False
+    finally:
+      if self.console:
+        self.console.stop_listening()
 
     return self.result
 
